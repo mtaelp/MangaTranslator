@@ -85,6 +85,8 @@ class TranslationConfig:
     osb_min_side_pixels: int = 128
     special_instructions: Optional[str] = None
     ocr_method: str = "LLM"  # "LLM" or "manga-ocr"
+    enable_context_aware_batch: bool = False
+    context_aware_batch_max_items: int = 400
 
 
 @dataclass

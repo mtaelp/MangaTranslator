@@ -94,6 +94,8 @@ def translate_and_render(
     config: MangaTranslatorConfig,
     output_path: Optional[Union[str, Path]] = None,
     cancellation_manager: Optional["CancellationManager"] = None,
+    context_memory: Optional[str] = None,
+    return_translation_data: bool = False,
 ):
     """
     Main function to translate manga speech bubbles and render translations using a config object.
@@ -340,6 +342,7 @@ def translate_and_render(
         raise CancellationError("Process cancelled by user.")
 
     final_image_to_save = pil_image_processed
+    translation_data = {"items": []}
 
     if not bubble_data and not outside_text_data:
         log_message("No speech bubbles or outside text detected", always_print=True)
@@ -660,6 +663,7 @@ def translate_and_render(
                                 full_image_mime_type=full_image_mime_type
                                 or "image/jpeg",
                                 bubble_metadata=sorted_bubble_data,
+                                context_memory=context_memory,
                                 debug=verbose,
                             )
                         except TranslationError as e:
@@ -727,6 +731,17 @@ def translate_and_render(
                 if len(translated_texts) == len(sorted_bubble_data):
                     for i, bubble in enumerate(sorted_bubble_data):
                         bubble["translation"] = translated_texts[i]
+                        if return_translation_data:
+                            translation_data["items"].append(
+                                {
+                                    "index": i + 1,
+                                    "bbox": list(bubble.get("bbox", [])),
+                                    "is_outside_text": bool(
+                                        bubble.get("is_outside_text", False)
+                                    ),
+                                    "translation": translated_texts[i],
+                                }
+                            )
                         bbox = bubble["bbox"]
                         text = bubble.get("translation", "")
                         is_outside_text = bubble.get("is_outside_text", False)
@@ -1139,7 +1154,63 @@ def translate_and_render(
     processing_time = end_time - start_time
     log_message(f"Processing completed in {processing_time:.2f}s", always_print=True)
 
+    if return_translation_data:
+        return final_image_to_save, translation_data
     return final_image_to_save
+
+
+def _build_batch_context_memory(first_pass_data: Dict[str, list], max_items: int = 400) -> str:
+    lines = [
+        "Use this chapter memory to keep names, tone, and recurring terms consistent across pages.",
+        "Prefer consistency with prior translations unless current page context clearly requires a change.",
+    ]
+    emitted = 0
+    for page_key in sorted(first_pass_data.keys()):
+        page_items = first_pass_data[page_key]
+        lines.append(f"{page_key}:")
+        for item in page_items:
+            text = (item.get("translation") or "").strip()
+            if not text:
+                continue
+            lines.append(f"- #{item.get('index', '?')}: {text}")
+            emitted += 1
+            if emitted >= max_items:
+                return "\n".join(lines)
+    return "\n".join(lines)
+
+
+def _resolve_batch_output_path(
+    img_path: Path,
+    input_dir: Path,
+    output_dir: Path,
+    preserve_structure: bool,
+    output_format: str,
+) -> Tuple[Path, str, str]:
+    if preserve_structure:
+        relative_path = img_path.relative_to(input_dir)
+        output_subdir = output_dir / relative_path.parent
+        os.makedirs(output_subdir, exist_ok=True)
+        output_filename = f"{relative_path.stem}_translated"
+        display_path = str(relative_path)
+        error_key = str(relative_path)
+    else:
+        output_subdir = output_dir
+        output_filename = f"{img_path.stem}_translated"
+        display_path = img_path.name
+        error_key = img_path.name
+
+    original_ext = img_path.suffix.lower()
+    if output_format == "jpeg":
+        output_ext = ".jpg"
+    elif output_format == "png":
+        output_ext = ".png"
+    elif output_format == "auto":
+        output_ext = original_ext
+    else:
+        output_ext = original_ext
+
+    output_path = output_subdir / f"{output_filename}{output_ext}"
+    return output_path, display_path, error_key
 
 
 def batch_translate_images(
@@ -1212,57 +1283,104 @@ def batch_translate_images(
     if progress_callback:
         progress_callback(0.0, f"Starting batch processing of {total_images} images...")
 
+    image_files = sorted(image_files)
+
+    use_context_aware_batch = bool(config.translation.enable_context_aware_batch)
+    first_pass_data: Dict[str, list] = {}
+    chapter_memory = ""
+
+    if use_context_aware_batch:
+        log_message(
+            "Context-aware batch enabled: running pass 1 (initial translation)",
+            always_print=True,
+        )
+        for i, img_path in enumerate(image_files):
+            try:
+                output_path, display_path, error_key = _resolve_batch_output_path(
+                    img_path,
+                    input_dir,
+                    output_dir,
+                    preserve_structure,
+                    config.output.output_format,
+                )
+                if cancellation_manager and cancellation_manager.is_cancelled():
+                    raise CancellationError("Batch process cancelled by user.")
+
+                if progress_callback:
+                    current_progress = (i / total_images) * 0.5
+                    progress_callback(
+                        current_progress,
+                        f"Pass 1/2 {i + 1}/{total_images}: {display_path}",
+                    )
+
+                _, translation_data = translate_and_render(
+                    img_path,
+                    config,
+                    output_path,
+                    cancellation_manager=cancellation_manager,
+                    return_translation_data=True,
+                )
+                first_pass_data[display_path] = translation_data.get("items", [])
+                results["success_count"] += 1
+            except CancellationError:
+                log_message(
+                    f"Batch cancelled during pass 1 processing of {display_path}",
+                    verbose=config.verbose,
+                )
+                raise
+            except Exception as e:
+                log_message(
+                    f"Error in pass 1 processing {display_path}: {str(e)}",
+                    always_print=True,
+                )
+                results["error_count"] += 1
+                results["errors"][error_key] = str(e)
+
+        chapter_memory = _build_batch_context_memory(
+            first_pass_data,
+            max_items=max(1, int(config.translation.context_aware_batch_max_items)),
+        )
+        results["success_count"] = 0
+        log_message(
+            "Context-aware batch pass 1 complete. Running pass 2 with chapter memory.",
+            always_print=True,
+        )
+
     for i, img_path in enumerate(image_files):
         try:
-            # Calculate relative path from input directory for structure preservation
-            if preserve_structure:
-                relative_path = img_path.relative_to(input_dir)
-                # Create output subdirectory structure
-                output_subdir = output_dir / relative_path.parent
-                os.makedirs(output_subdir, exist_ok=True)
-                # Use relative path for output filename
-                output_filename = f"{relative_path.stem}_translated"
-                display_path = str(relative_path)
-                error_key = str(relative_path)
-            else:
-                output_subdir = output_dir
-                output_filename = f"{img_path.stem}_translated"
-                display_path = img_path.name
-                error_key = img_path.name
+            output_path, display_path, error_key = _resolve_batch_output_path(
+                img_path,
+                input_dir,
+                output_dir,
+                preserve_structure,
+                config.output.output_format,
+            )
 
             if cancellation_manager and cancellation_manager.is_cancelled():
                 raise CancellationError("Batch process cancelled by user.")
 
             if progress_callback:
-                current_progress = i / total_images
+                if use_context_aware_batch:
+                    current_progress = 0.5 + (i / total_images) * 0.5
+                    status_prefix = "Pass 2/2"
+                else:
+                    current_progress = i / total_images
+                    status_prefix = "Processing"
                 progress_callback(
                     current_progress,
-                    f"Processing image {i + 1}/{total_images}: {display_path}",
+                    f"{status_prefix} image {i + 1}/{total_images}: {display_path}",
                 )
 
-            original_ext = img_path.suffix.lower()
-            desired_format = config.output.output_format
-            if desired_format == "jpeg":
-                output_ext = ".jpg"
-            elif desired_format == "png":
-                output_ext = ".png"
-            elif desired_format == "auto":
-                output_ext = original_ext
-            else:
-                output_ext = original_ext
-                log_message(
-                    f"Warning: Invalid output_format '{desired_format}' in config. "
-                    f"Using original extension '{original_ext}'.",
-                    always_print=True,
-                )
-
-            output_path = output_subdir / f"{output_filename}{output_ext}"
             log_message(
                 f"Processing {i + 1}/{total_images}: {display_path}", always_print=True
             )
 
             translate_and_render(
-                img_path, config, output_path, cancellation_manager=cancellation_manager
+                img_path,
+                config,
+                output_path,
+                cancellation_manager=cancellation_manager,
+                context_memory=chapter_memory if use_context_aware_batch else None,
             )
 
             results["success_count"] += 1
