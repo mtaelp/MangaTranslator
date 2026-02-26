@@ -467,6 +467,19 @@ def main():
         default=None,
         help="Optional special instructions for the LLM (formatting, context, character names, etc.)",
     )
+    parser.add_argument(
+        "--context-aware-batch",
+        action="store_true",
+        help=(
+            "Enable two-pass context-aware batch mode: first pass builds chapter memory, second pass retranslates with that memory"
+        ),
+    )
+    parser.add_argument(
+        "--context-aware-batch-max-items",
+        type=int,
+        default=400,
+        help="Maximum translated items to include in generated chapter memory",
+    )
     # Full page context toggle
     parser.add_argument(
         "--no-full-page-context",
@@ -865,6 +878,8 @@ def main():
             osb_min_side_pixels=args.osb_min_side_pixels,
             special_instructions=args.special_instructions,
             ocr_method=args.ocr_method,
+            enable_context_aware_batch=args.context_aware_batch,
+            context_aware_batch_max_items=args.context_aware_batch_max_items,
         ),
         rendering=RenderingConfig(
             font_dir=args.font_dir,

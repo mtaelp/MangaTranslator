@@ -1082,6 +1082,7 @@ def call_translation_api_batch(
     mime_types: List[str],
     full_image_mime_type: str,
     bubble_metadata: List[Dict[str, Any]],
+    context_memory: Optional[str] = None,
     debug: bool = False,
 ) -> List[str]:
     """
@@ -1141,7 +1142,12 @@ def call_translation_api_batch(
         context_hints = "\nNote: " + " ".join(hints) + " Translate them accordingly."
 
     cache = get_cache()
-    cache_key = cache.get_translation_cache_key(images_b64, full_image_b64, config)
+    memory_suffix = context_memory or ""
+    cache_key = cache.get_translation_cache_key(
+        images_b64,
+        f"{full_image_b64}{memory_suffix}",
+        config,
+    )
     cached_translation = cache.get_translation(cache_key)
     if cached_translation is not None:
         log_message("  - Using cached translation", verbose=debug)
@@ -1178,9 +1184,16 @@ def call_translation_api_batch(
         if translation_mode == "two-step":
             special_instructions_section = _format_special_instructions(config)
 
+            memory_section = (
+                f"\n## CHAPTER MEMORY\n{context_memory}\n"
+                if context_memory
+                else ""
+            )
+
             ocr_prompt = f"""
 ## CONTEXT
 You have been provided with {total_elements} individual text images from a manga page.
+{memory_section}
 
 ## TASK
 Apply your OCR transcription rules to each image provided.{special_instructions_section}
@@ -1240,6 +1253,7 @@ Apply your OCR transcription rules to each image provided.{special_instructions_
 ## CONTEXT
 You have been provided with a list of {total_elements} transcribed text segments from a manga page. {full_page_context}
 {context_hints}
+{memory_section}
 
 {ocr_input_section}
 
@@ -1347,10 +1361,17 @@ The target language is {output_language}. Use the appropriate translation approa
 
             special_instructions_section = _format_special_instructions(config)
 
+            memory_section = (
+                f"\n## CHAPTER MEMORY\n{context_memory}\n"
+                if context_memory
+                else ""
+            )
+
             one_step_prompt = f"""
 ## CONTEXT
 You have been provided with {total_elements} individual text images from a manga page. {full_page_context}
 {context_hints}
+{memory_section}
 
 ## TASK
 For each image, you must perform two steps:
